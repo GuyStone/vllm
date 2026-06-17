@@ -53,6 +53,71 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
+@dataclass
+class CascadeAttentionStats:
+    """Lightweight, process-local instrumentation for cascade attention.
+
+    Cascade attention (the two-kernel shared-prefix + per-request-suffix path)
+    is decided per forward step inside ``FlashAttentionMetadataBuilder.build``,
+    but vLLM otherwise exposes no signal that it actually engaged. This counter
+    makes cascade activation observable from user code (e.g. a beam-search
+    benchmark) when the engine runs in-process
+    (``VLLM_ENABLE_V1_MULTIPROCESSING=0``).
+    """
+
+    build_calls: int = 0  # total attention-metadata builds observed
+    cascade_steps: int = 0  # builds where cascade attention was active
+    prefix_tokens_total: int = 0  # sum of common_prefix_len over cascade steps
+    max_prefix_len: int = 0  # longest shared prefix seen (tokens)
+    max_num_reqs: int = 0  # largest batch that used cascade
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "build_calls": self.build_calls,
+            "cascade_steps": self.cascade_steps,
+            "prefix_tokens_total": self.prefix_tokens_total,
+            "max_prefix_len": self.max_prefix_len,
+            "max_num_reqs": self.max_num_reqs,
+        }
+
+
+_CASCADE_STATS = CascadeAttentionStats()
+# Emit a one-time INFO log on the first cascade activation so the event is
+# visible even when the engine runs in a separate process.
+_CASCADE_LOGGED = False
+
+
+def get_cascade_attention_stats() -> CascadeAttentionStats:
+    """Return the process-local cascade-attention activation counters."""
+    return _CASCADE_STATS
+
+
+def reset_cascade_attention_stats() -> None:
+    """Reset the cascade-attention counters (call before a measured run)."""
+    global _CASCADE_STATS, _CASCADE_LOGGED
+    _CASCADE_STATS = CascadeAttentionStats()
+    _CASCADE_LOGGED = False
+
+
+def _record_cascade_build(use_cascade: bool, common_prefix_len: int, num_reqs: int) -> None:
+    global _CASCADE_LOGGED
+    _CASCADE_STATS.build_calls += 1
+    if not use_cascade:
+        return
+    _CASCADE_STATS.cascade_steps += 1
+    _CASCADE_STATS.prefix_tokens_total += common_prefix_len
+    _CASCADE_STATS.max_prefix_len = max(_CASCADE_STATS.max_prefix_len, common_prefix_len)
+    _CASCADE_STATS.max_num_reqs = max(_CASCADE_STATS.max_num_reqs, num_reqs)
+    if not _CASCADE_LOGGED:
+        _CASCADE_LOGGED = True
+        logger.info(
+            "Cascade attention ACTIVE: common_prefix_len=%d tokens, num_reqs=%d "
+            "(shared prefix computed once, merged with per-request suffix).",
+            common_prefix_len,
+            num_reqs,
+        )
+
+
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
@@ -392,6 +457,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             return None
 
         use_cascade = common_prefix_len > 0
+        _record_cascade_build(use_cascade, common_prefix_len, num_reqs)
         max_dcp_context_kv_len = 0
         dcp_context_kv_lens = None
 
