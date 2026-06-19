@@ -61,6 +61,11 @@ class BeamSearchOnlineMixin(ABC):
             logprobs=logprobs_num,
             max_tokens=1,
             temperature=temperature,
+            # Beam search only consumes logprob floats and token ids; it never
+            # uses the decoded logprob strings (final sequences are detokenized
+            # separately). Skipping detokenization avoids O(beam_width^2)
+            # tokenizer.decode calls per step on the 2*beam_width logprobs.
+            detokenize=False,
         )
         all_beams = [
             BeamSearchSequence(
