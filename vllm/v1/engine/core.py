@@ -416,68 +416,88 @@ class EngineCore:
 
     def run_beam_search(
         self,
-        request: EngineCoreRequest,
+        requests: list[EngineCoreRequest],
         beam_width: int,
         max_tokens: int,
         length_penalty: float,
         ignore_eos: bool,
         eos_token_id: int | None,
-    ) -> list[tuple[list[int], float]]:
-        """Engine-native beam search (M1 prototype).
+    ) -> list[list[tuple[list[int], float]]]:
+        """Engine-native beam search over a batch of prompts (M1 prototype).
 
-        Runs the full per-step expand/prune loop *inside* the engine, so beams
-        never cross the client<->engine boundary per step (the round-trips nsys
-        showed dominate after the detokenize fix). KV for the shared prompt and any
-        common generated prefix is reused via prefix caching; only the short
-        divergent tail recomputes (no KV-fork primitive yet -- that is M2).
+        Runs the full per-step expand/prune loop *inside* the engine for all
+        prompts at once, so beams never cross the client<->engine boundary per
+        step (the round-trips nsys showed dominate after the detokenize fix) and
+        every unfinished group's live beams share a single forward pass per step
+        (better GPU utilization for batch candidate generation). KV for the shared
+        prompt and common generated prefix is reused via prefix caching; only the
+        short divergent tail recomputes (no KV-fork yet -- that is M2).
 
-        Selection logic lives in BeamGroupState and is proven equivalent to the
+        Selection logic lives in BeamGroupState, proven equivalent to the
         client-side online.py loop (tests/v1/engine/test_beam_search_group.py).
 
-        Prototype constraint: this drives ``self.step()`` directly and therefore
-        assumes a *dedicated* engine -- no concurrent non-beam requests, one beam
-        search at a time. Intended for offline / rec-only batch use.
+        Prototype constraint: drives ``self.step()`` directly, so it assumes a
+        *dedicated* engine (no concurrent non-beam requests). Intended for offline
+        / rec-only batch use.
 
         Args:
-            request: the base request (its sampling_params must already request
+            requests: base requests, one per prompt (sampling_params must request
                 ``logprobs=2*beam_width``, ``max_tokens=1``, ``detokenize=False``).
             beam_width / max_tokens / length_penalty / ignore_eos / eos_token_id:
-                beam search parameters.
+                beam search parameters shared by all prompts.
 
         Returns:
-            All ``(generated_token_ids, cum_logprob)`` pairs in the final pool
-            (completed beams + surviving live beams), unranked. The caller applies
-            the final length-penalty selection over the full sequence (prompt +
-            generated) so engine-native results match the client-side path exactly.
+            For each prompt, all ``(generated_token_ids, cum_logprob)`` pairs in its
+            final pool (completed + surviving live beams), unranked. The caller
+            applies the final length-penalty selection over the full sequence so
+            engine-native results match the client-side path exactly.
         """
         from vllm.v1.engine.beam_search_group import BeamGroupState
 
-        prompt_token_ids = list(request.prompt_token_ids or [])
-        state = BeamGroupState(
-            beam_width=beam_width,
-            max_tokens=max_tokens,
-            eos_token_id=eos_token_id,
-            length_penalty=length_penalty,
-            ignore_eos=ignore_eos,
-        )
+        # Over the utility RPC, list[EngineCoreRequest] is not auto-converted
+        # (only bare-Struct annotations are), so rebuild Structs from raw msgpack.
+        requests = [
+            r
+            if isinstance(r, EngineCoreRequest)
+            else msgspec.convert(r, EngineCoreRequest)
+            for r in requests
+        ]
+        prompts = [list(r.prompt_token_ids or []) for r in requests]
+        states = [
+            BeamGroupState(
+                beam_width=beam_width,
+                max_tokens=max_tokens,
+                eos_token_id=eos_token_id,
+                length_penalty=length_penalty,
+                ignore_eos=ignore_eos,
+            )
+            for _ in requests
+        ]
+        done = [False] * len(requests)
 
         step = 0
-        while True:
-            live_beams = state.beams
-            req_ids: list[str] = []
-            for i, beam in enumerate(live_beams):
-                child = msgspec.structs.replace(
-                    request,
-                    request_id=f"{request.request_id}::bs{step}::{i}",
-                    prompt_token_ids=prompt_token_ids + beam.tokens,
-                )
-                self.add_request(
-                    Request.from_engine_core_request(child, self.request_block_hasher)
-                )
-                req_ids.append(child.request_id)
+        while not all(done):
+            # One engine request per live beam across all unfinished groups; run
+            # them together (a single forward pass per step over the whole batch).
+            req_owner: dict[str, tuple[int, int]] = {}  # req_id -> (group, beam)
+            for g, (request, state) in enumerate(zip(requests, states)):
+                if done[g]:
+                    continue
+                for i, beam in enumerate(state.beams):
+                    child = msgspec.structs.replace(
+                        request,
+                        request_id=f"{request.request_id}::bs{step}::{g}::{i}",
+                        prompt_token_ids=prompts[g] + beam.tokens,
+                    )
+                    self.add_request(
+                        Request.from_engine_core_request(
+                            child, self.request_block_hasher
+                        )
+                    )
+                    req_owner[child.request_id] = (g, i)
 
             # Drive the engine until every beam request has produced its token.
-            pending = set(req_ids)
+            pending = set(req_owner)
             logprobs_by_req: dict[str, Any] = {}
             while pending:
                 engine_core_outputs, _ = self.step()
@@ -489,14 +509,13 @@ class EngineCore:
                             logprobs_by_req[out.request_id] = out.new_logprobs
                         if out.finish_reason is not None:
                             pending.discard(out.request_id)
-            self.abort_requests(req_ids)
+            self.abort_requests(list(req_owner))
 
-            # Build per-beam candidate (token_id -> logprob) dicts, matching the
-            # client-side path (online.py consumes result.outputs[0].logprobs[0]).
-            per_beam_token_ids: list[list[int]] = []
-            per_beam_logprobs: list[list[float]] = []
-            for rid in req_ids:
-                logprobs_lists = logprobs_by_req[rid]
+            # Regroup candidate (token_id -> logprob) dicts per (group, beam),
+            # matching the client path (online.py uses result.outputs[0].logprobs[0]).
+            per_group: dict[int, dict[int, tuple[list[int], list[float]]]] = {}
+            for req_id, (g, i) in req_owner.items():
+                logprobs_lists = logprobs_by_req[req_id]
                 token_ids_row = logprobs_lists.logprob_token_ids[0]
                 logprobs_row = logprobs_lists.logprobs[0]
                 cand: dict[int, float] = {}
@@ -504,19 +523,27 @@ class EngineCore:
                     token_ids_row.tolist(), logprobs_row.tolist()
                 ):
                     cand[int(token_id)] = float(logprob)
-                per_beam_token_ids.append(list(cand.keys()))
-                per_beam_logprobs.append(list(cand.values()))
+                per_group.setdefault(g, {})[i] = (
+                    list(cand.keys()),
+                    list(cand.values()),
+                )
 
-            done = state.step(per_beam_token_ids, per_beam_logprobs)
+            for g, state in enumerate(states):
+                if done[g]:
+                    continue
+                group = per_group[g]
+                num_beams = len(state.beams)
+                done[g] = state.step(
+                    [group[i][0] for i in range(num_beams)],
+                    [group[i][1] for i in range(num_beams)],
+                )
             step += 1
-            if done:
-                break
 
-        # Return the full pool (completed + surviving live beams); the caller
-        # ranks by the full-sequence length penalty to match the client path.
+        # Per prompt, return the full pool (completed + surviving live beams); the
+        # caller ranks by the full-sequence length penalty to match the client path.
         return [
-            (beam.tokens, beam.cum_logprob)
-            for beam in (state.completed + state.beams)
+            [(beam.tokens, beam.cum_logprob) for beam in (s.completed + s.beams)]
+            for s in states
         ]
 
     @contextmanager

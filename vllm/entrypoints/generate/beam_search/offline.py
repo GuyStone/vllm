@@ -239,24 +239,28 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
         outputs match exactly.
         """
         supported_tasks = self.llm_engine.get_supported_tasks()
-        outputs: list[BeamSearchOutput] = []
-        for prompt, lora_req in zip(engine_inputs, lora_requests):
-            prompt_token_ids = prompt["prompt_token_ids"]
-            request = self.llm_engine.input_processor.process_inputs(
+        requests = [
+            self.llm_engine.input_processor.process_inputs(
                 f"beam-{random_uuid()}",
                 prompt,
                 base_sampling_params,
                 supported_tasks=supported_tasks,
                 lora_request=lora_req,
             )
-            pool = self.llm_engine.engine_core.run_beam_search(
-                request,
-                beam_width,
-                max_tokens,
-                length_penalty,
-                ignore_eos,
-                eos_token_id,
-            )
+            for prompt, lora_req in zip(engine_inputs, lora_requests)
+        ]
+        # One call runs all prompts' beams together (batched per step in-engine).
+        pools = self.llm_engine.engine_core.run_beam_search(
+            requests,
+            beam_width,
+            max_tokens,
+            length_penalty,
+            ignore_eos,
+            eos_token_id,
+        )
+        outputs: list[BeamSearchOutput] = []
+        for prompt, lora_req, pool in zip(engine_inputs, lora_requests, pools):
+            prompt_token_ids = prompt["prompt_token_ids"]
             beams = [
                 BeamSearchSequence(
                     orig_prompt=prompt,

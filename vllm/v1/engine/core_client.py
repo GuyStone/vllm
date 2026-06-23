@@ -145,13 +145,13 @@ class EngineCoreClient(ABC):
 
     def run_beam_search(
         self,
-        request: EngineCoreRequest,
+        requests: list[EngineCoreRequest],
         beam_width: int,
         max_tokens: int,
         length_penalty: float,
         ignore_eos: bool,
         eos_token_id: int | None,
-    ) -> list[tuple[list[int], float]]:
+    ) -> list[list[tuple[list[int], float]]]:
         raise NotImplementedError
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
@@ -231,13 +231,13 @@ class EngineCoreClient(ABC):
 
     async def run_beam_search_async(
         self,
-        request: EngineCoreRequest,
+        requests: list[EngineCoreRequest],
         beam_width: int,
         max_tokens: int,
         length_penalty: float,
         ignore_eos: bool,
         eos_token_id: int | None,
-    ) -> list[tuple[list[int], float]]:
+    ) -> list[list[tuple[list[int], float]]]:
         raise NotImplementedError
 
     async def profile_async(
@@ -322,15 +322,15 @@ class InprocClient(EngineCoreClient):
 
     def run_beam_search(
         self,
-        request: EngineCoreRequest,
+        requests: list[EngineCoreRequest],
         beam_width: int,
         max_tokens: int,
         length_penalty: float,
         ignore_eos: bool,
         eos_token_id: int | None,
-    ) -> list[tuple[list[int], float]]:
+    ) -> list[list[tuple[list[int], float]]]:
         return self.engine_core.run_beam_search(
-            request, beam_width, max_tokens, length_penalty, ignore_eos, eos_token_id
+            requests, beam_width, max_tokens, length_penalty, ignore_eos, eos_token_id
         )
 
     def abort_requests(self, request_ids: list[str]) -> None:
@@ -925,16 +925,16 @@ class SyncMPClient(MPClient):
 
     def run_beam_search(
         self,
-        request: EngineCoreRequest,
+        requests: list[EngineCoreRequest],
         beam_width: int,
         max_tokens: int,
         length_penalty: float,
         ignore_eos: bool,
         eos_token_id: int | None,
-    ) -> list[tuple[list[int], float]]:
+    ) -> list[list[tuple[list[int], float]]]:
         return self.call_utility(
             "run_beam_search",
-            request,
+            requests,
             beam_width,
             max_tokens,
             length_penalty,
@@ -1179,16 +1179,16 @@ class AsyncMPClient(MPClient):
 
     async def run_beam_search_async(
         self,
-        request: EngineCoreRequest,
+        requests: list[EngineCoreRequest],
         beam_width: int,
         max_tokens: int,
         length_penalty: float,
         ignore_eos: bool,
         eos_token_id: int | None,
-    ) -> list[tuple[list[int], float]]:
+    ) -> list[list[tuple[list[int], float]]]:
         return await self.call_utility_async(
             "run_beam_search",
-            request,
+            requests,
             beam_width,
             max_tokens,
             length_penalty,
