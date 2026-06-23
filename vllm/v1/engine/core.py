@@ -445,8 +445,10 @@ class EngineCore:
                 beam search parameters.
 
         Returns:
-            The best ``beam_width`` ``(generated_token_ids, cum_logprob)`` pairs,
-            ranked by the HF length-penalty score.
+            All ``(generated_token_ids, cum_logprob)`` pairs in the final pool
+            (completed beams + surviving live beams), unranked. The caller applies
+            the final length-penalty selection over the full sequence (prompt +
+            generated) so engine-native results match the client-side path exactly.
         """
         from vllm.v1.engine.beam_search_group import BeamGroupState
 
@@ -510,7 +512,12 @@ class EngineCore:
             if done:
                 break
 
-        return [(beam.tokens, beam.cum_logprob) for beam in state.finalize()]
+        # Return the full pool (completed + surviving live beams); the caller
+        # ranks by the full-sequence length penalty to match the client path.
+        return [
+            (beam.tokens, beam.cum_logprob)
+            for beam in (state.completed + state.beams)
+        ]
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):

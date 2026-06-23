@@ -7,6 +7,7 @@ from collections.abc import Callable, Sequence
 import torch
 from tqdm import tqdm
 
+import vllm.envs as envs
 from vllm import RequestOutput, TextPrompt, TokensPrompt
 from vllm.entrypoints.offline_utils import OfflineInferenceMixin
 from vllm.logger import init_logger
@@ -18,6 +19,7 @@ from vllm.sampling_params import (
     StructuredOutputsParams,
 )
 from vllm.tokenizers import TokenizerLike
+from vllm.utils import random_uuid
 from vllm.v1.structured_output.backend_types import StructuredOutputBackend
 from vllm.v1.structured_output.request import get_structured_output_key
 
@@ -126,6 +128,25 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
             # tokenizer.decode calls per step on the 2*beam_width logprobs.
             detokenize=False,
         )
+
+        if (
+            envs.VLLM_ENGINE_NATIVE_BEAM_SEARCH
+            and structured_output_backend is None
+            and all(p["type"] == "token" for p in engine_inputs)
+        ):
+            return self._engine_native_beam_search(
+                engine_inputs,
+                lora_requests,
+                base_sampling_params,
+                beam_width,
+                max_tokens,
+                length_penalty,
+                ignore_eos,
+                eos_token_id,
+                sort_beams_key,
+                tokenizer,
+            )
+
         instances: list[BeamSearchInstance] = []
 
         for lora_req, prompt in zip(lora_requests, engine_inputs):
@@ -193,6 +214,63 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
 
             outputs.append(BeamSearchOutput(sequences=best_beams))
 
+        return outputs
+
+    def _engine_native_beam_search(
+        self,
+        engine_inputs: Sequence[dict],
+        lora_requests: Sequence[LoRARequest | None],
+        base_sampling_params: SamplingParams,
+        beam_width: int,
+        max_tokens: int,
+        length_penalty: float,
+        ignore_eos: bool,
+        eos_token_id: int | None,
+        sort_beams_key: Callable,
+        tokenizer: TokenizerLike,
+    ) -> list[BeamSearchOutput]:
+        """Engine-native beam search (VLLM_ENGINE_NATIVE_BEAM_SEARCH).
+
+        Runs each prompt's entire search inside the engine via a single RPC
+        instead of the per-step client loop, reusing prefix caching for the
+        shared-prefix KV. Restricted to plain token prompts without structured
+        output (the caller falls back to the client-side loop otherwise). The
+        final beam_width selection below is identical to the client path, so the
+        outputs match exactly.
+        """
+        supported_tasks = self.llm_engine.get_supported_tasks()
+        outputs: list[BeamSearchOutput] = []
+        for prompt, lora_req in zip(engine_inputs, lora_requests):
+            prompt_token_ids = prompt["prompt_token_ids"]
+            request = self.llm_engine.input_processor.process_inputs(
+                f"beam-{random_uuid()}",
+                prompt,
+                base_sampling_params,
+                supported_tasks=supported_tasks,
+                lora_request=lora_req,
+            )
+            pool = self.llm_engine.engine_core.run_beam_search(
+                request,
+                beam_width,
+                max_tokens,
+                length_penalty,
+                ignore_eos,
+                eos_token_id,
+            )
+            beams = [
+                BeamSearchSequence(
+                    orig_prompt=prompt,
+                    tokens=prompt_token_ids + list(gen_token_ids),
+                    logprobs=[],
+                    lora_request=lora_req,
+                    cum_logprob=cum_logprob,
+                )
+                for gen_token_ids, cum_logprob in pool
+            ]
+            best_beams = sorted(beams, key=sort_beams_key, reverse=True)[:beam_width]
+            for beam in best_beams:
+                beam.text = tokenizer.decode(beam.tokens)
+            outputs.append(BeamSearchOutput(sequences=best_beams))
         return outputs
 
     def _beam_search_step(
