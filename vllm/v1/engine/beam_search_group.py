@@ -44,6 +44,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+import numpy as np
+
 
 def get_beam_search_score(
     seq_len: int,
@@ -74,15 +76,6 @@ class Beam:
     parent_idx: int = -1
     finished: bool = False
     finish_reason: str | None = None
-
-
-@dataclass
-class BeamCandidate:
-    """A single (parent_beam, token) expansion considered during a step."""
-
-    parent_idx: int
-    token_id: int
-    cum_logprob: float
 
 
 @dataclass
@@ -142,53 +135,53 @@ class BeamGroupState:
             f"got {len(per_beam_token_ids)}"
         )
 
-        # 1) Expand: every (beam, candidate-token) pair, scored by accumulated logprob.
-        candidates: list[BeamCandidate] = []
-        for beam_idx, beam in enumerate(self.beams):
-            for token_id, logprob in zip(
-                per_beam_token_ids[beam_idx], per_beam_logprobs[beam_idx]
-            ):
-                candidates.append(
-                    BeamCandidate(
-                        parent_idx=beam_idx,
-                        token_id=token_id,
-                        cum_logprob=beam.cum_logprob + logprob,
-                    )
-                )
+        # 1) Vectorised expand: flatten every (beam, candidate-token) pair into
+        #    numpy arrays (avoids materialising O(beam_width * 2*beam_width) Python
+        #    objects + a Python sort each step).
+        num_beams = len(self.beams)
+        lengths = [len(toks) for toks in per_beam_token_ids]
+        token_ids = np.concatenate(
+            [np.asarray(t, dtype=np.int64) for t in per_beam_token_ids]
+        )
+        flat_logprobs = np.concatenate(
+            [np.asarray(lp, dtype=np.float64) for lp in per_beam_logprobs]
+        )
+        parent_idx = np.repeat(np.arange(num_beams), lengths)
+        base_cum = np.array([b.cum_logprob for b in self.beams], dtype=np.float64)
+        cum = np.repeat(base_cum, lengths) + flat_logprobs
 
-        # 2) Route EOS candidates to the completed pool (and exclude from the live
-        #    top-k), matching online.py's eos masking.
-        live_candidates: list[BeamCandidate] = []
-        for cand in candidates:
-            parent = self.beams[cand.parent_idx]
-            if (
-                not self.ignore_eos
-                and self.eos_token_id is not None
-                and cand.token_id == self.eos_token_id
-            ):
+        # 2) Route EOS candidates to the completed pool, then mask them to -inf so
+        #    they drop out of the live top-k (matches online.py's eos masking).
+        if not self.ignore_eos and self.eos_token_id is not None:
+            eos_positions = np.nonzero(token_ids == self.eos_token_id)[0]
+            for pos in eos_positions:
+                parent = self.beams[int(parent_idx[pos])]
                 self.completed.append(
                     Beam(
-                        tokens=parent.tokens + [cand.token_id],
-                        cum_logprob=cand.cum_logprob,
-                        parent_idx=cand.parent_idx,
+                        tokens=parent.tokens + [self.eos_token_id],
+                        cum_logprob=float(cum[pos]),
+                        parent_idx=int(parent_idx[pos]),
                         finished=True,
                         finish_reason="stop",
                     )
                 )
-            else:
-                live_candidates.append(cand)
+            cum[eos_positions] = float("-inf")
 
-        # 3) Keep the top ``beam_width`` live candidates by cumulative logprob.
-        live_candidates.sort(key=lambda c: c.cum_logprob, reverse=True)
-        survivors = live_candidates[: self.beam_width]
+        # 3) Keep the top ``beam_width`` live candidates by cumulative logprob
+        #    (O(n) argpartition + a small sort of just the survivors for order).
+        if cum.size <= self.beam_width:
+            top = np.argsort(-cum)
+        else:
+            top = np.argpartition(-cum, self.beam_width)[: self.beam_width]
+            top = top[np.argsort(-cum[top])]
 
         self.beams = [
             Beam(
-                tokens=self.beams[c.parent_idx].tokens + [c.token_id],
-                cum_logprob=c.cum_logprob,
-                parent_idx=c.parent_idx,
+                tokens=self.beams[int(parent_idx[i])].tokens + [int(token_ids[i])],
+                cum_logprob=float(cum[i]),
+                parent_idx=int(parent_idx[i]),
             )
-            for c in survivors
+            for i in top
         ]
         self.step_idx += 1
 
