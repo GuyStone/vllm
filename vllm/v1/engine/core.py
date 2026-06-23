@@ -414,6 +414,104 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    def run_beam_search(
+        self,
+        request: EngineCoreRequest,
+        beam_width: int,
+        max_tokens: int,
+        length_penalty: float,
+        ignore_eos: bool,
+        eos_token_id: int | None,
+    ) -> list[tuple[list[int], float]]:
+        """Engine-native beam search (M1 prototype).
+
+        Runs the full per-step expand/prune loop *inside* the engine, so beams
+        never cross the client<->engine boundary per step (the round-trips nsys
+        showed dominate after the detokenize fix). KV for the shared prompt and any
+        common generated prefix is reused via prefix caching; only the short
+        divergent tail recomputes (no KV-fork primitive yet -- that is M2).
+
+        Selection logic lives in BeamGroupState and is proven equivalent to the
+        client-side online.py loop (tests/v1/engine/test_beam_search_group.py).
+
+        Prototype constraint: this drives ``self.step()`` directly and therefore
+        assumes a *dedicated* engine -- no concurrent non-beam requests, one beam
+        search at a time. Intended for offline / rec-only batch use.
+
+        Args:
+            request: the base request (its sampling_params must already request
+                ``logprobs=2*beam_width``, ``max_tokens=1``, ``detokenize=False``).
+            beam_width / max_tokens / length_penalty / ignore_eos / eos_token_id:
+                beam search parameters.
+
+        Returns:
+            The best ``beam_width`` ``(generated_token_ids, cum_logprob)`` pairs,
+            ranked by the HF length-penalty score.
+        """
+        from vllm.v1.engine.beam_search_group import BeamGroupState
+
+        prompt_token_ids = list(request.prompt_token_ids or [])
+        state = BeamGroupState(
+            beam_width=beam_width,
+            max_tokens=max_tokens,
+            eos_token_id=eos_token_id,
+            length_penalty=length_penalty,
+            ignore_eos=ignore_eos,
+        )
+
+        step = 0
+        while True:
+            live_beams = state.beams
+            req_ids: list[str] = []
+            for i, beam in enumerate(live_beams):
+                child = msgspec.structs.replace(
+                    request,
+                    request_id=f"{request.request_id}::bs{step}::{i}",
+                    prompt_token_ids=prompt_token_ids + beam.tokens,
+                )
+                self.add_request(
+                    Request.from_engine_core_request(child, self.request_block_hasher)
+                )
+                req_ids.append(child.request_id)
+
+            # Drive the engine until every beam request has produced its token.
+            pending = set(req_ids)
+            logprobs_by_req: dict[str, Any] = {}
+            while pending:
+                engine_core_outputs, _ = self.step()
+                for outputs in engine_core_outputs.values():
+                    for out in outputs.outputs:
+                        if out.request_id not in pending:
+                            continue
+                        if out.new_logprobs is not None:
+                            logprobs_by_req[out.request_id] = out.new_logprobs
+                        if out.finish_reason is not None:
+                            pending.discard(out.request_id)
+            self.abort_requests(req_ids)
+
+            # Build per-beam candidate (token_id -> logprob) dicts, matching the
+            # client-side path (online.py consumes result.outputs[0].logprobs[0]).
+            per_beam_token_ids: list[list[int]] = []
+            per_beam_logprobs: list[list[float]] = []
+            for rid in req_ids:
+                logprobs_lists = logprobs_by_req[rid]
+                token_ids_row = logprobs_lists.logprob_token_ids[0]
+                logprobs_row = logprobs_lists.logprobs[0]
+                cand: dict[int, float] = {}
+                for token_id, logprob in zip(
+                    token_ids_row.tolist(), logprobs_row.tolist()
+                ):
+                    cand[int(token_id)] = float(logprob)
+                per_beam_token_ids.append(list(cand.keys()))
+                per_beam_logprobs.append(list(cand.values()))
+
+            done = state.step(per_beam_token_ids, per_beam_logprobs)
+            step += 1
+            if done:
+                break
+
+        return [(beam.tokens, beam.cum_logprob) for beam in state.finalize()]
+
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""

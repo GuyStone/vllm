@@ -36,6 +36,10 @@ if TYPE_CHECKING:
     VLLM_USAGE_STATS_SERVER: str = "https://stats.vllm.ai"
     VLLM_NO_USAGE_STATS: bool = False
     VLLM_DO_NOT_TRACK: bool = False
+    # Run beam search inside the engine core (one RPC for the whole search)
+    # instead of the per-step client loop. Prototype: requires a dedicated
+    # engine (no concurrent non-beam traffic). Off by default.
+    VLLM_ENGINE_NATIVE_BEAM_SEARCH: bool = False
     VLLM_USAGE_SOURCE: str = "production"
     VLLM_CONFIGURE_LOGGING: bool = True
     VLLM_LOGGING_LEVEL: str = "INFO"
@@ -572,6 +576,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    "VLLM_ENGINE_NATIVE_BEAM_SEARCH": lambda: bool(
+        int(os.getenv("VLLM_ENGINE_NATIVE_BEAM_SEARCH", "0"))
+    ),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel Xe2/Xe3; the non-TD branch is dead-code-eliminated at Triton
