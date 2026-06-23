@@ -143,6 +143,17 @@ class EngineCoreClient(ABC):
     def add_request(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
+    def run_beam_search(
+        self,
+        request: EngineCoreRequest,
+        beam_width: int,
+        max_tokens: int,
+        length_penalty: float,
+        ignore_eos: bool,
+        eos_token_id: int | None,
+    ) -> list[tuple[list[int], float]]:
+        raise NotImplementedError
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         raise NotImplementedError
 
@@ -216,6 +227,17 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
+        raise NotImplementedError
+
+    async def run_beam_search_async(
+        self,
+        request: EngineCoreRequest,
+        beam_width: int,
+        max_tokens: int,
+        length_penalty: float,
+        ignore_eos: bool,
+        eos_token_id: int | None,
+    ) -> list[tuple[list[int], float]]:
         raise NotImplementedError
 
     async def profile_async(
@@ -297,6 +319,19 @@ class InprocClient(EngineCoreClient):
     def add_request(self, request: EngineCoreRequest) -> None:
         req, request_wave = self.engine_core.preprocess_add_request(request)
         self.engine_core.add_request(req, request_wave)
+
+    def run_beam_search(
+        self,
+        request: EngineCoreRequest,
+        beam_width: int,
+        max_tokens: int,
+        length_penalty: float,
+        ignore_eos: bool,
+        eos_token_id: int | None,
+    ) -> list[tuple[list[int], float]]:
+        return self.engine_core.run_beam_search(
+            request, beam_width, max_tokens, length_penalty, ignore_eos, eos_token_id
+        )
 
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
@@ -888,6 +923,25 @@ class SyncMPClient(MPClient):
             self.engines_running = True
         self._send_input(EngineCoreRequestType.ADD, request)
 
+    def run_beam_search(
+        self,
+        request: EngineCoreRequest,
+        beam_width: int,
+        max_tokens: int,
+        length_penalty: float,
+        ignore_eos: bool,
+        eos_token_id: int | None,
+    ) -> list[tuple[list[int], float]]:
+        return self.call_utility(
+            "run_beam_search",
+            request,
+            beam_width,
+            max_tokens,
+            length_penalty,
+            ignore_eos,
+            eos_token_id,
+        )
+
     def abort_requests(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
@@ -1122,6 +1176,25 @@ class AsyncMPClient(MPClient):
         request.client_index = self.client_index
         await self._send_input(EngineCoreRequestType.ADD, request)
         self._ensure_output_queue_task()
+
+    async def run_beam_search_async(
+        self,
+        request: EngineCoreRequest,
+        beam_width: int,
+        max_tokens: int,
+        length_penalty: float,
+        ignore_eos: bool,
+        eos_token_id: int | None,
+    ) -> list[tuple[list[int], float]]:
+        return await self.call_utility_async(
+            "run_beam_search",
+            request,
+            beam_width,
+            max_tokens,
+            length_penalty,
+            ignore_eos,
+            eos_token_id,
+        )
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
