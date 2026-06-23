@@ -14,7 +14,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from vllm.v1.engine.beam_search_group import BeamGroupState, get_beam_search_score
+from vllm.v1.engine.beam_search_group import (
+    BeamGroupState,
+    BeamSearchManager,
+    get_beam_search_score,
+)
 
 VOCAB = 1000
 NEG_INF = float("-inf")
@@ -135,6 +139,80 @@ def test_beam_group_matches_reference(
     for (gt, gs), (rt, rs) in zip(got, ref):
         assert gt == rt
         assert gs == pytest.approx(rs, abs=1e-9)
+
+
+class _FakeLogprobs:
+    """Duck-typed LogprobsLists: row-0 holds this step's candidate (ids, logprobs)."""
+
+    def __init__(self, token_ids, logprobs):
+        self.logprob_token_ids = np.asarray([token_ids])
+        self.logprobs = np.asarray([logprobs], dtype=float)
+
+
+class _FakeBase:
+    prompt_token_ids: list[int] = []
+
+
+def _direct_pool(oracle, beam_width, max_tokens, eos, ignore_eos, length_penalty):
+    """Run BeamGroupState directly; return the full (completed + live) pool."""
+    state = BeamGroupState(
+        beam_width=beam_width, max_tokens=max_tokens, eos_token_id=eos,
+        length_penalty=length_penalty, ignore_eos=ignore_eos,
+    )
+    done = False
+    while not done:
+        per_tok, per_lp = [], []
+        for beam in state.beams:
+            t, lp = oracle(beam.tokens)
+            per_tok.append(t)
+            per_lp.append(lp)
+        done = state.step(per_tok, per_lp)
+    return [(b.tokens, b.cum_logprob) for b in (state.completed + state.beams)]
+
+
+def _run_manager(oracles, beam_width, max_tokens, eos, ignore_eos, length_penalty):
+    """Drive BeamSearchManager event-style (as the engine would) for all groups
+    interleaved; return {group_id: pool}. make_child returns (req_id, tokens)."""
+    mgr = BeamSearchManager(make_child=lambda base, rid, toks: (rid, toks))
+    current = []  # list of (req_id, tokens) currently in flight
+    for gid, _ in oracles.items():
+        current += mgr.add_group(
+            gid, _FakeBase(), beam_width, max_tokens, length_penalty, ignore_eos, eos
+        )
+    results: dict = {}
+    while mgr.active:
+        # Empty-prompt fakes: tokens == generated tokens, so oracle(tokens) works.
+        for req_id, toks in current:
+            gid = req_id.split("::")[0]
+            tok, lp = oracles[gid](toks)
+            mgr.on_output(req_id, _FakeLogprobs(tok, lp), finished=True)
+        _abort, current = mgr.advance()
+        results.update(mgr.pop_finished())
+    return results
+
+
+@pytest.mark.parametrize("beam_width", [2, 4, 8])
+@pytest.mark.parametrize("max_tokens", [1, 4, 8])
+@pytest.mark.parametrize("ignore_eos", [True, False])
+@pytest.mark.parametrize("seed", [0, 3])
+def test_manager_matches_direct_loop(beam_width, max_tokens, ignore_eos, seed):
+    eos, lp = 42, 1.0
+    oracle = make_oracle(seed, eos, eos_prob=0.3, n_cand=2 * beam_width)
+    direct = _direct_pool(oracle, beam_width, max_tokens, eos, ignore_eos, lp)
+    got = _run_manager({"g0": oracle}, beam_width, max_tokens, eos, ignore_eos, lp)
+    assert got["g0"] == direct
+
+
+def test_manager_multi_group_interleaved():
+    """Several groups driven concurrently must each match their solo direct loop."""
+    bw, mt, eos, lp = 4, 6, 42, 1.0
+    oracles = {
+        f"g{i}": make_oracle(i, eos, eos_prob=0.3, n_cand=2 * bw) for i in range(4)
+    }
+    got = _run_manager(oracles, bw, mt, eos, False, lp)
+    assert set(got) == set(oracles)
+    for gid, oracle in oracles.items():
+        assert got[gid] == _direct_pool(oracle, bw, mt, eos, False, lp)
 
 
 def test_parent_idx_tracked_for_reparenting():

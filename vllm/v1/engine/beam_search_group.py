@@ -41,8 +41,9 @@ survivors, and finally rank completed+live by the HF length-penalty score
 
 from __future__ import annotations
 
-import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -198,6 +199,160 @@ class BeamGroupState:
         return pool[: self.beam_width]
 
 
-def has_converged_to_finite(scores: list[float]) -> bool:
-    """Small helper: True if every score is finite (no all -inf degenerate state)."""
-    return all(math.isfinite(s) for s in scores)
+def candidates_from_logprobs(new_logprobs: Any) -> tuple[list[int], list[float]]:
+    """Extract the per-beam candidate (token_id -> logprob) dict from a step's
+    ``LogprobsLists``, matching the client path (online.py consumes
+    ``result.outputs[0].logprobs[0]``). Returns parallel (token_ids, logprobs).
+    """
+    token_ids_row = new_logprobs.logprob_token_ids[0]
+    logprobs_row = new_logprobs.logprobs[0]
+    cand: dict[int, float] = {}
+    for token_id, logprob in zip(token_ids_row.tolist(), logprobs_row.tolist()):
+        cand[int(token_id)] = float(logprob)
+    return list(cand.keys()), list(cand.values())
+
+
+@dataclass
+class _ManagedGroup:
+    state: BeamGroupState
+    base_request: Any
+    prompt_token_ids: list[int]
+    step: int = 0
+    beam_reqs: list[str] = field(default_factory=list)  # req_id per live beam
+    pending: set[str] = field(default_factory=set)  # beams awaiting their token
+    logprobs: dict[str, Any] = field(default_factory=dict)
+    finished: bool = False
+    result: list[tuple[list[int], float]] | None = None
+
+
+class BeamSearchManager:
+    """Event-driven driver for many engine-native beam groups (M2 foundation).
+
+    Designed to run *inside the normal engine step loop*: each beam is an ordinary
+    engine request that batches/interleaves with all other traffic, so beam search
+    no longer monopolizes the engine (the M1 ``run_beam_search`` limitation).
+    Survivors are re-prefilled each step via prefix caching (no KV fork yet -- that
+    is a later optimization).
+
+    Engine-agnostic and unit-testable: ``make_child(base_request, req_id,
+    token_ids) -> request`` builds whatever request object the engine schedules;
+    the manager only owns beam-group lifecycle and the expand/prune (delegated to
+    the proven BeamGroupState).
+
+    Usage from the engine each step:
+        on_output(req_id, out.new_logprobs, out.finish_reason is not None)  # per beam
+        abort, add = advance()      # prune groups whose beams all produced a token
+        results = pop_finished()    # {group_id: [(tokens, cum_logprob), ...]}
+    """
+
+    def __init__(self, make_child: Callable[[Any, str, list[int]], Any]):
+        self._make_child = make_child
+        self._groups: dict[str, _ManagedGroup] = {}
+        self._req_to_group: dict[str, str] = {}
+
+    def owns(self, req_id: str) -> bool:
+        return req_id in self._req_to_group
+
+    @property
+    def active(self) -> bool:
+        return any(not g.finished for g in self._groups.values())
+
+    def add_group(
+        self,
+        group_id: str,
+        base_request: Any,
+        beam_width: int,
+        max_tokens: int,
+        length_penalty: float,
+        ignore_eos: bool,
+        eos_token_id: int | None,
+    ) -> list[Any]:
+        """Register a beam group; return the initial beam requests to schedule."""
+        group = _ManagedGroup(
+            state=BeamGroupState(
+                beam_width=beam_width,
+                max_tokens=max_tokens,
+                eos_token_id=eos_token_id,
+                length_penalty=length_penalty,
+                ignore_eos=ignore_eos,
+            ),
+            base_request=base_request,
+            prompt_token_ids=list(
+                getattr(base_request, "prompt_token_ids", None) or []
+            ),
+        )
+        self._groups[group_id] = group
+        return self._spawn(group_id)
+
+    def _spawn(self, group_id: str) -> list[Any]:
+        group = self._groups[group_id]
+        group.beam_reqs = []
+        group.pending = set()
+        group.logprobs = {}
+        requests: list[Any] = []
+        for i, beam in enumerate(group.state.beams):
+            req_id = f"{group_id}::bs{group.step}::{i}"
+            self._req_to_group[req_id] = group_id
+            group.beam_reqs.append(req_id)
+            group.pending.add(req_id)
+            requests.append(
+                self._make_child(
+                    group.base_request, req_id, group.prompt_token_ids + beam.tokens
+                )
+            )
+        return requests
+
+    def on_output(self, req_id: str, new_logprobs: Any, finished: bool) -> None:
+        """Record a beam request's per-step output (call once per engine output)."""
+        group_id = self._req_to_group.get(req_id)
+        if group_id is None:
+            return
+        group = self._groups[group_id]
+        if new_logprobs is not None:
+            group.logprobs[req_id] = new_logprobs
+        if finished:
+            group.pending.discard(req_id)
+
+    def advance(self) -> tuple[list[str], list[Any]]:
+        """Advance every group whose beams have all produced their token.
+
+        Returns ``(req_ids_to_abort, requests_to_add)`` for this round; finished
+        groups' results are retrieved via :meth:`pop_finished`.
+        """
+        to_abort: list[str] = []
+        to_add: list[Any] = []
+        for group_id, group in self._groups.items():
+            if group.finished or group.pending:
+                continue
+            per_beam_token_ids: list[list[int]] = []
+            per_beam_logprobs: list[list[float]] = []
+            for req_id in group.beam_reqs:
+                tok, lp = candidates_from_logprobs(group.logprobs[req_id])
+                per_beam_token_ids.append(tok)
+                per_beam_logprobs.append(lp)
+            for req_id in group.beam_reqs:
+                to_abort.append(req_id)
+                del self._req_to_group[req_id]
+
+            done = group.state.step(per_beam_token_ids, per_beam_logprobs)
+            group.step += 1
+            if done:
+                group.finished = True
+                group.result = [
+                    (beam.tokens, beam.cum_logprob)
+                    for beam in (group.state.completed + group.state.beams)
+                ]
+            else:
+                to_add.extend(self._spawn(group_id))
+        return to_abort, to_add
+
+    def pop_finished(self) -> dict[str, list[tuple[list[int], float]]]:
+        """Remove and return results for groups that finished this round."""
+        finished: dict[str, list[tuple[list[int], float]]] = {}
+        for group_id in list(self._groups):
+            group = self._groups[group_id]
+            if group.finished:
+                assert group.result is not None
+                finished[group_id] = group.result
+                del self._groups[group_id]
+        return finished
