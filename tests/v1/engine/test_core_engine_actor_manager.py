@@ -320,7 +320,7 @@ def test_ray_dp_addresses_resolved_before_actor_creation(
             # API-server children bind to the pre-allocated ports.
             api_server_manager = APIServerProcessManager(
                 listen_address="tcp://127.0.0.1:0",
-                sock=sock,
+                sockets=[sock],
                 args="test_args",
                 num_servers=2,
                 input_addresses=addresses.inputs,

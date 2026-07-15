@@ -22,7 +22,7 @@ WORKER_RUNTIME_SECONDS = 0.5
 
 
 # Mock implementation of run_api_server_worker
-def mock_run_api_server_worker(listen_address, sock, args, client_config=None):
+def mock_run_api_server_worker(listen_address, sockets, args, client_config=None):
     """Mock run_api_server_worker that runs for a specific time."""
     print(f"Mock worker started with client_config: {client_config}")
     time.sleep(WORKER_RUNTIME_SECONDS)
@@ -31,7 +31,7 @@ def mock_run_api_server_worker(listen_address, sock, args, client_config=None):
 
 # Module-level stub for the gather_actual_addresses test. Must be
 # importable by `multiprocessing.spawn` (no closures, no nesting).
-def defer_addresses_stub_worker(listen_address, sock, args, client_config):
+def defer_addresses_stub_worker(listen_address, sockets, args, client_config):
     """Bind ROUTER/PULL with a kernel-assigned port, report the actual
     endpoints back via the pipe, then exit."""
     ctx = zmq.Context()
@@ -65,11 +65,12 @@ def defer_addresses_stub_worker(listen_address, sock, args, client_config):
 @pytest.fixture
 def api_server_args():
     """Fixture to provide arguments for APIServerProcessManager."""
-    sock = socket.socket()
     return {
         "target_server_fn": mock_run_api_server_worker,
         "listen_address": "localhost:8000",
-        "sock": sock,
+        # Two sockets to exercise pickling a multi-family socket list
+        # across the spawn boundary.
+        "sockets": [socket.socket(), socket.socket()],
         "args": "test_args",  # Simple string to avoid pickling issues
         "num_servers": 3,
         "input_addresses": [
@@ -331,7 +332,7 @@ def test_gather_actual_addresses_end_to_end():
     sock = socket.socket()
     manager = APIServerProcessManager(
         listen_address=f"tcp://{host}:0",
-        sock=sock,
+        sockets=[sock],
         args="test_args",
         num_servers=num_servers,
         input_addresses=placeholder_inputs,
@@ -378,7 +379,7 @@ def test_gather_actual_addresses_child_crash_before_report():
     sock = socket.socket()
     manager = APIServerProcessManager(
         listen_address=f"tcp://{host}:0",
-        sock=sock,
+        sockets=[sock],
         args="test_args",
         num_servers=num_servers,
         input_addresses=placeholder_inputs,

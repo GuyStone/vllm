@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import errno
 import ipaddress
 import os
 import socket
@@ -100,6 +101,14 @@ def get_loopback_ip() -> str:
         )
 
 
+def is_valid_ipv4_address(address: str) -> bool:
+    try:
+        ipaddress.IPv4Address(address)
+        return True
+    except ValueError:
+        return False
+
+
 def is_valid_ipv6_address(address: str) -> bool:
     try:
         ipaddress.IPv6Address(address)
@@ -187,6 +196,24 @@ def get_open_ports_list(count: int = 5) -> list[int]:
     return list(ports_set)
 
 
+def _free_on_family(port: int, family: socket.AddressFamily) -> bool:
+    """Whether ``port`` can also be bound on ``family``'s wildcard, so a
+    server binding every address family can use it."""
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+    except OSError:
+        # Family unsupported on this host; nothing to collide with.
+        return True
+    with sock:
+        if family == socket.AF_INET6 and hasattr(socket, "IPPROTO_IPV6"):
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        try:
+            sock.bind(("", port))
+        except OSError as exc:
+            return exc.errno != errno.EADDRINUSE
+    return True
+
+
 def _get_open_port(
     start_port: int | None = None,
     max_attempts: int | None = None,
@@ -199,6 +226,8 @@ def _get_open_port(
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     s.bind(("", port))
+                    if not _free_on_family(port, socket.AF_INET6):
+                        raise OSError(errno.EADDRINUSE, "port in use on IPv6")
                     return port
             except OSError:
                 port += 1  # Increment port number if already in use
@@ -211,9 +240,14 @@ def _get_open_port(
                 )
     # try ipv4
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+        candidate = 0
+        for _ in range(10):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("", 0))
+                candidate = s.getsockname()[1]
+                if _free_on_family(candidate, socket.AF_INET6):
+                    return candidate
+        return candidate
     except OSError:
         # try ipv6
         with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:

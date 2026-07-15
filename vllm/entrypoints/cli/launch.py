@@ -120,7 +120,7 @@ async def run_launch_fastapi(args: argparse.Namespace) -> None:
     signal.signal(signal.SIGTERM, _interrupt_init)
 
     # 1. Socket binding
-    listen_address, sock = setup_server(args, reuse_port=False)
+    listen_address, sockets = setup_server(args, reuse_port=False)
 
     # 2. Build and serve the API server
     engine_args = AsyncEngineArgs.from_cli_args(args)
@@ -136,9 +136,10 @@ async def run_launch_fastapi(args: argparse.Namespace) -> None:
 
     vllm_config = VllmConfig(model_config=model_config)
     shutdown_task = await build_and_serve_renderer(
-        vllm_config, listen_address, sock, args
+        vllm_config, listen_address, sockets, args
     )
     try:
         await shutdown_task
     finally:
-        sock.close()
+        for sock in sockets:
+            sock.close()

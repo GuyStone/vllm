@@ -59,7 +59,7 @@ from vllm.platforms import current_platform
 from vllm.tokenizers import get_tokenizer
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.mem_constants import GB_bytes
-from vllm.utils.network_utils import get_open_port
+from vllm.utils.network_utils import get_open_port, join_host_port
 from vllm.utils.torch_utils import (
     set_random_seed,  # noqa: F401 - re-exported for use in test files
 )
@@ -715,12 +715,17 @@ class RemoteVLLMServer:
         return (
             f"http://{self.uds.split('/')[-1]}"
             if self.uds
-            else f"http://{self.host}:{self.port}"
+            else f"http://{join_host_port(self.host, self.port)}"
         )
 
     def url_for(self, *parts: str) -> str:
         path = "/".join(part.strip("/") for part in parts if part)
         return f"{self.url_root}/{path}"
+
+    def url_for_host(self, host: str, *parts: str) -> str:
+        """Like ``url_for``, but targeting a specific address of this server."""
+        path = "/".join(part.strip("/") for part in parts if part)
+        return f"http://{join_host_port(host, self.port)}/{path}"
 
     def get_client(self, **kwargs):
         if "timeout" not in kwargs:

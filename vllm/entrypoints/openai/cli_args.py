@@ -225,7 +225,11 @@ class FrontendArgs(BaseFrontendArgs):
     """Arguments for the OpenAI-compatible frontend server."""
 
     host: str | None = None
-    """Host name."""
+    """Host name or IP address to bind. When unset, listens on all local
+    addresses across all supported address families (IPv4 and IPv6). Use
+    `0.0.0.0` for all IPv4 addresses only, or `::` for the IPv6 wildcard
+    (which also accepts IPv4 where the kernel supports dual-stack). A host
+    name listens on every address it resolves to."""
     port: int = 8000
     """Port number."""
     data_parallel_supervisor_port: int = 9256

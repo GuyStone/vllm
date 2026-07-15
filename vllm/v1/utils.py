@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import json
 import multiprocessing
+import socket
 import threading
 import time
 import weakref
@@ -173,7 +174,7 @@ class APIServerProcessManager:
     def __init__(
         self,
         listen_address: str,
-        sock: Any,
+        sockets: list[socket.socket],
         args: argparse.Namespace,
         num_servers: int,
         input_addresses: list[str],
@@ -193,7 +194,7 @@ class APIServerProcessManager:
         Args:
             target_server_fn: Override function to call for each API server process
             listen_address: Address to listen for client connections
-            sock: Socket for client connections
+            sockets: Listening sockets for client connections
             args: Command line arguments
             num_servers: Number of API server processes to start
             input_addresses: Input addresses for each API server
@@ -202,7 +203,7 @@ class APIServerProcessManager:
             tensor_queue: Optional tensor IPC queue for sharing MM tensors
         """
         self.listen_address = listen_address
-        self.sock = sock
+        self.sockets = sockets
         self.args = args
 
         spawn_context = multiprocessing.get_context("spawn")
@@ -230,7 +231,7 @@ class APIServerProcessManager:
             proc = spawn_context.Process(
                 target=target_server_fn or run_api_server_worker_proc,
                 name=f"ApiServer_{i}",
-                args=(listen_address, sock, args, client_config),
+                args=(listen_address, sockets, args, client_config),
             )
             self.processes.append(proc)
             proc.start()
@@ -333,7 +334,7 @@ class RustFrontendProcessManager:
     def __init__(
         self,
         binary_path: str,
-        sock: Any,
+        sockets: list[socket.socket],
         args: argparse.Namespace,
         input_address: str,
         output_address: str,
@@ -343,6 +344,18 @@ class RustFrontendProcessManager:
     ):
         import os
         import subprocess
+
+        # The Rust frontend accepts a single listen fd. Prefer the IPv4
+        # socket to match the historical single-socket default.
+        sock = next((s for s in sockets if s.family == socket.AF_INET), sockets[0])
+        for extra in sockets:
+            if extra is not sock:
+                logger.warning(
+                    "Rust frontend supports a single listen socket; "
+                    "closing extra socket bound to %s",
+                    extra.getsockname(),
+                )
+                extra.close()
 
         fd = sock.fileno()
         os.set_inheritable(fd, True)
@@ -496,7 +509,7 @@ def _shutdown_subprocesses(
 
 
 def run_api_server_worker_proc(
-    listen_address, sock, args, client_config=None, **uvicorn_kwargs
+    listen_address, sockets, args, client_config=None, **uvicorn_kwargs
 ) -> None:
     """Entrypoint for individual API server worker processes."""
 
@@ -510,7 +523,9 @@ def run_api_server_worker_proc(
     decorate_logs()
 
     uvloop.run(
-        run_server_worker(listen_address, sock, args, client_config, **uvicorn_kwargs)
+        run_server_worker(
+            listen_address, sockets, args, client_config, **uvicorn_kwargs
+        )
     )
 
 

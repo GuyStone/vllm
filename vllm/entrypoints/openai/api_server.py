@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import errno
 import importlib
 import inspect
 import multiprocessing
@@ -65,7 +66,7 @@ from vllm.tool_parsers import ToolParserManager
 from vllm.tracing import instrument
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.utils.network_utils import is_valid_ipv6_address
+from vllm.utils.network_utils import is_valid_ipv4_address, is_valid_ipv6_address
 from vllm.utils.system_utils import decorate_logs, set_ulimit
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.version import __version__ as VLLM_VERSION
@@ -570,22 +571,128 @@ async def init_render_app_state(
     await _init_endpoint_plugins_state(None, state, args)
 
 
-def create_server_socket(
-    addr: tuple[str, int],
+def create_server_sockets(
+    addr: tuple[str | None, int],
     *,
     reuse_port: bool,
-) -> socket.socket:
-    family = socket.AF_INET
-    if is_valid_ipv6_address(addr[0]):
-        family = socket.AF_INET6
+) -> list[socket.socket]:
+    """Create one bound server socket per address family for ``addr``.
 
-    sock = socket.socket(family=family, type=socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    if reuse_port:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    sock.bind(addr)
+    Mirrors ``asyncio.base_events.BaseEventLoop.create_server``: an
+    unspecified host resolves via ``getaddrinfo(..., AI_PASSIVE)`` and binds
+    every returned family (IPv4 and IPv6), skipping families the platform
+    does not support. Literal addresses bind a single socket without a
+    resolver call.
+    """
+    host, port = addr
+    host = host or None
 
-    return sock
+    infos: list[tuple[socket.AddressFamily, socket.SocketKind, int, str, Any]]
+    if host is not None and (
+        is_valid_ipv4_address(host) or is_valid_ipv6_address(host)
+    ):
+        family = socket.AF_INET6 if is_valid_ipv6_address(host) else socket.AF_INET
+        infos = [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (host, port))]
+        # No IPV6_V6ONLY on a literal "::": keep the kernel's dual-stack
+        # default so it accepts IPv4 too.
+        set_v6only = False
+    else:
+        infos = list(
+            dict.fromkeys(
+                socket.getaddrinfo(
+                    host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+                )
+            )
+        )
+        set_v6only = True
+
+    # With port 0 and several families, the first bind picks the ephemeral
+    # port for the remaining families; an unrelated listener may already
+    # hold that port on another family, so retry with a fresh port.
+    attempts = 5 if port == 0 and len(infos) > 1 else 1
+    for attempt in range(attempts):
+        try:
+            return _bind_server_sockets(
+                infos, host, port, reuse_port=reuse_port, set_v6only=set_v6only
+            )
+        except OSError as exc:
+            if attempt == attempts - 1 or exc.errno != errno.EADDRINUSE:
+                raise
+    raise AssertionError("unreachable")
+
+
+def _bind_server_sockets(
+    infos: list[tuple[socket.AddressFamily, socket.SocketKind, int, str, Any]],
+    host: str | None,
+    port: int,
+    *,
+    reuse_port: bool,
+    set_v6only: bool,
+) -> list[socket.socket]:
+    sockets: list[socket.socket] = []
+    last_error: OSError | None = None
+    bound_port: int | None = None
+    completed = False
+    try:
+        for family, socktype, proto, _, sockaddr in infos:
+            try:
+                sock = socket.socket(family, socktype, proto)
+            except OSError as exc:
+                # The platform lacks support for this family (e.g. IPv6
+                # disabled); bind whatever families remain.
+                last_error = exc
+                continue
+            sockets.append(sock)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if reuse_port:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            if (
+                set_v6only
+                and family == socket.AF_INET6
+                and hasattr(socket, "IPPROTO_IPV6")
+            ):
+                # Each resolved family gets its own wildcard socket; keep
+                # "::" from also claiming the IPv4-mapped wildcard and
+                # colliding with the "0.0.0.0" bind.
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            if port == 0 and bound_port is not None:
+                # Keep every family on the same ephemeral port.
+                sockaddr = (sockaddr[0], bound_port, *sockaddr[2:])
+            try:
+                sock.bind(sockaddr)
+            except OSError as exc:
+                if exc.errno == errno.EADDRNOTAVAIL:
+                    # The resolver returned an address this machine cannot
+                    # bind (family present but not configured); skip it.
+                    last_error = exc
+                    sockets.remove(sock)
+                    sock.close()
+                    continue
+                raise OSError(
+                    exc.errno,
+                    f"error while attempting to bind on address {sockaddr!r}: "
+                    f"{exc.strerror}",
+                ) from None
+            if port == 0 and bound_port is None:
+                bound_port = sock.getsockname()[1]
+            logger.debug(
+                "Bound server socket family=%s type=%s proto=%s sockaddr=%s",
+                family,
+                socktype,
+                proto,
+                sockaddr,
+            )
+        if not sockets:
+            raise OSError(
+                f"could not bind to any address for host {host!r} port {port}"
+            ) from last_error
+        completed = True
+    finally:
+        if not completed:
+            for sock in sockets:
+                sock.close()
+
+    return sockets
 
 
 def create_server_unix_socket(path: str) -> socket.socket:
@@ -631,10 +738,10 @@ def setup_server(args, *, reuse_port: bool):
     # This avoids race conditions with ray.
     # see https://github.com/vllm-project/vllm/issues/8204
     if args.uds:
-        sock = create_server_unix_socket(args.uds)
+        sockets = [create_server_unix_socket(args.uds)]
     else:
-        sock_addr = (args.host or "", args.port)
-        sock = create_server_socket(sock_addr, reuse_port=reuse_port)
+        sock_addr = (args.host or None, args.port)
+        sockets = create_server_sockets(sock_addr, reuse_port=reuse_port)
 
     # workaround to avoid footguns where uvicorn drops requests with too
     # many concurrent requests active
@@ -645,15 +752,17 @@ def setup_server(args, *, reuse_port: bool):
     else:
         addr, port = sock_addr
         is_ssl = args.ssl_keyfile and args.ssl_certfile
-        host_part = f"[{addr}]" if is_valid_ipv6_address(addr) else addr or "0.0.0.0"
+        host_part = (
+            f"[{addr}]" if addr and is_valid_ipv6_address(addr) else addr or "0.0.0.0"
+        )
         listen_address = f"http{'s' if is_ssl else ''}://{host_part}:{port}"
-    return listen_address, sock
+    return listen_address, sockets
 
 
 async def build_and_serve(
     engine_client: EngineClient,
     listen_address: str,
-    sock: socket.socket,
+    sockets: list[socket.socket],
     args: Namespace,
     **uvicorn_kwargs,
 ) -> asyncio.Task:
@@ -678,7 +787,7 @@ async def build_and_serve(
 
     return await serve_http(
         app,
-        sock=sock,
+        sockets=sockets,
         enable_ssl_refresh=args.enable_ssl_refresh,
         host=args.host,
         port=args.port,
@@ -701,7 +810,7 @@ async def build_and_serve(
 async def build_and_serve_renderer(
     vllm_config: VllmConfig,
     listen_address: str,
-    sock: socket.socket,
+    sockets: list[socket.socket],
     args: Namespace,
     **uvicorn_kwargs,
 ) -> asyncio.Task:
@@ -723,7 +832,7 @@ async def build_and_serve_renderer(
 
     return await serve_http(
         app,
-        sock=sock,
+        sockets=sockets,
         enable_ssl_refresh=args.enable_ssl_refresh,
         host=args.host,
         port=args.port,
@@ -755,12 +864,12 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     signal.signal(signal.SIGTERM, _interrupt_init)
 
-    listen_address, sock = setup_server(args, reuse_port=False)
-    await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+    listen_address, sockets = setup_server(args, reuse_port=False)
+    await run_server_worker(listen_address, sockets, args, **uvicorn_kwargs)
 
 
 async def run_server_worker(
-    listen_address, sock, args, client_config=None, **uvicorn_kwargs
+    listen_address, sockets, args, client_config=None, **uvicorn_kwargs
 ) -> None:
     """Run a single API server worker."""
 
@@ -775,13 +884,14 @@ async def run_server_worker(
         client_config=client_config,
     ) as engine_client:
         shutdown_task = await build_and_serve(
-            engine_client, listen_address, sock, args, **uvicorn_kwargs
+            engine_client, listen_address, sockets, args, **uvicorn_kwargs
         )
     # NB: Await server shutdown only after the backend context is exited
     try:
         await shutdown_task
     finally:
-        sock.close()
+        for sock in sockets:
+            sock.close()
 
 
 if __name__ == "__main__":

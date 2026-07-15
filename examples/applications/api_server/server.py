@@ -136,7 +136,7 @@ async def run_server(
 
     shutdown_task = await serve_http(
         app,
-        sock=None,
+        sockets=None,
         enable_ssl_refresh=args.enable_ssl_refresh,
         host=args.host,
         port=args.port,

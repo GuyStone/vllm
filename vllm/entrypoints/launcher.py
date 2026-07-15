@@ -25,7 +25,7 @@ logger = init_logger(__name__)
 
 async def serve_http(
     app: FastAPI,
-    sock: socket.socket | None,
+    sockets: list[socket.socket] | None,
     enable_ssl_refresh: bool = False,
     **uvicorn_kwargs: Any,
 ):
@@ -79,7 +79,7 @@ async def serve_http(
     loop = asyncio.get_running_loop()
 
     watchdog_task = loop.create_task(watchdog_loop(server, app.state.engine_client))
-    server_task = loop.create_task(server.serve(sockets=[sock] if sock else None))
+    server_task = loop.create_task(server.serve(sockets=sockets if sockets else None))
 
     ssl_cert_refresher = (
         None
