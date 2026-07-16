@@ -265,6 +265,13 @@ def run_multi_api_server(args: argparse.Namespace):
             "VLLM_RUST_FRONTEND_PATH does not support api_server_count > 1"
         )
 
+    if rust_frontend_path and not args.host and not args.uds:
+        # The Rust frontend accepts a single listen fd, so an unset host must
+        # not dual-bind: the extra IPv6 socket would be closed immediately and
+        # can fail startup outright when another process already holds the
+        # port on IPv6 only. Keep the historical IPv4 wildcard.
+        args.host = "0.0.0.0"
+
     if num_api_servers > 1:
         setup_multiprocess_prometheus()
 
