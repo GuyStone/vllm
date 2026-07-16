@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import MISSING, Field, asdict, dataclass, field
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pydantic
 import pytest
@@ -1552,6 +1552,77 @@ def test_eagle_draft_model_config():
     assert draft_model_config.hf_text_config.model_type == "eagle"
     assert draft_model_config.architectures == ["EagleLlamaForCausalLM"]
     assert draft_model_config.architecture == "EagleLlamaForCausalLM"
+
+
+def _mock_draft_model_config(model: str, model_type: str) -> MagicMock:
+    """Draft ModelConfig as produced for a local (non object-storage) path:
+    ``model_weights`` stays empty because the path is not an object-storage
+    URI."""
+    draft = MagicMock()
+    draft.model = model
+    draft.model_weights = ""
+    draft.hf_config.model_type = model_type
+    draft.hf_config.n_predict = None
+    draft.max_model_len = 4096
+    draft.get_vocab_size.return_value = 32000
+    return draft
+
+
+def _mock_object_storage_target_config(model: str, model_weights: str) -> MagicMock:
+    """Target ModelConfig resolved from object storage: ``model`` was
+    rewritten to a local config-only cache dir while ``model_weights`` keeps
+    the original URL."""
+    target = MagicMock()
+    target.model = model
+    target.model_weights = model_weights
+    target.quantization = None
+    target.max_model_len = 4096
+    target.get_vocab_size.return_value = 32000
+    return target
+
+
+@patch("vllm.config.speculative.ModelConfig")
+def test_mtp_draft_inherits_object_storage_model_weights(mock_model_config_cls):
+    """An MTP draft shares the target checkpoint, so it must inherit the
+    target's object-storage weight source. Otherwise draft weight loading
+    falls back to the local config-only cache dir (which contains no
+    safetensors) and fails."""
+    s3_url = "s3://bucket/mtp-model/"
+    local_cache = "/root/.cache/vllm/assets/model_streamer/abcd1234"
+
+    draft = _mock_draft_model_config(local_cache, "deepseek_mtp")
+    mock_model_config_cls.return_value = draft
+    target = _mock_object_storage_target_config(local_cache, s3_url)
+
+    SpeculativeConfig(
+        method="mtp",
+        num_speculative_tokens=1,
+        target_model_config=target,
+        target_parallel_config=ParallelConfig(),
+    )
+
+    assert draft.model_weights == s3_url
+
+
+@patch("vllm.config.speculative.ModelConfig")
+def test_draft_with_own_checkpoint_keeps_own_weight_source(mock_model_config_cls):
+    """A draft with its own checkpoint must not inherit the target's
+    object-storage weight source."""
+    draft = _mock_draft_model_config("/local/hf/other-draft", "llama")
+    mock_model_config_cls.return_value = draft
+    target = _mock_object_storage_target_config(
+        "/root/.cache/vllm/assets/model_streamer/abcd1234", "s3://bucket/mtp-model/"
+    )
+
+    SpeculativeConfig(
+        model="org/other-draft",
+        method="draft_model",
+        num_speculative_tokens=1,
+        target_model_config=target,
+        target_parallel_config=ParallelConfig(),
+    )
+
+    assert draft.model_weights == ""
 
 
 def test_draft_sample_method_probabilistic_is_accepted():

@@ -821,6 +821,7 @@ class SpeculativeConfig:
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,
                 )
+                self._maybe_inherit_target_model_weights()
 
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # omit vocab_size in config.json, so MedusaConfig falls back to
@@ -989,6 +990,25 @@ class SpeculativeConfig:
                     )
                 )
         return self
+
+    def _maybe_inherit_target_model_weights(self) -> None:
+        """Propagate the target's weight source to a draft sharing its checkpoint.
+
+        For object-storage models (e.g. ``runai_streamer`` with ``s3://``),
+        ``ModelConfig.model`` is rewritten to a local config-only cache dir
+        while ``model_weights`` keeps the original URL. A draft built from
+        ``target_model_config.model`` (mtp, dspark) must inherit that weight
+        source; otherwise draft weight loading falls back to the config-only
+        cache dir, which contains no safetensors.
+        """
+        draft = self.draft_model_config
+        target = self.target_model_config
+        if (
+            not draft.model_weights
+            and target.model_weights
+            and draft.model == target.model
+        ):
+            draft.model_weights = target.model_weights
 
     def _validate_suffix_decoding(self):
         if not has_arctic_inference():
