@@ -66,7 +66,11 @@ from vllm.tool_parsers import ToolParserManager
 from vllm.tracing import instrument
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.utils.network_utils import is_valid_ipv4_address, is_valid_ipv6_address
+from vllm.utils.network_utils import (
+    is_valid_ipv4_address,
+    is_valid_ipv6_address,
+    join_host_port,
+)
 from vllm.utils.system_utils import decorate_logs, set_ulimit
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.version import __version__ as VLLM_VERSION
@@ -640,6 +644,13 @@ def _bind_server_sockets(
             except OSError as exc:
                 # The platform lacks support for this family (e.g. IPv6
                 # disabled); bind whatever families remain.
+                logger.warning(
+                    "Skipping %s for %s: socket creation failed (%s: %s)",
+                    family.name,
+                    sockaddr,
+                    errno.errorcode.get(exc.errno or 0, exc.errno),
+                    exc.strerror or exc,
+                )
                 last_error = exc
                 continue
             sockets.append(sock)
@@ -664,14 +675,19 @@ def _bind_server_sockets(
                 if exc.errno == errno.EADDRNOTAVAIL:
                     # The resolver returned an address this machine cannot
                     # bind (family present but not configured); skip it.
+                    logger.warning(
+                        "Skipping %s (%s): bind failed (EADDRNOTAVAIL: %s)",
+                        sockaddr,
+                        family.name,
+                        exc.strerror or exc,
+                    )
                     last_error = exc
                     sockets.remove(sock)
                     sock.close()
                     continue
                 raise OSError(
                     exc.errno,
-                    f"error while attempting to bind on address {sockaddr!r}: "
-                    f"{exc.strerror}",
+                    f"error while attempting to bind on address {sockaddr!r}: {exc}",
                 ) from None
             if port == 0 and bound_port is None:
                 bound_port = sock.getsockname()[1]
@@ -742,6 +758,10 @@ def setup_server(args, *, reuse_port: bool):
     else:
         sock_addr = (args.host or None, args.port)
         sockets = create_server_sockets(sock_addr, reuse_port=reuse_port)
+        logger.info(
+            "Listening on %s",
+            ", ".join(join_host_port(*s.getsockname()[:2]) for s in sockets),
+        )
 
     # workaround to avoid footguns where uvicorn drops requests with too
     # many concurrent requests active
