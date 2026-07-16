@@ -129,6 +129,10 @@ means:
 - **Block all incoming connections except to the TCP port the API server is
 listening on.**
 
+- Note that when `--host` is not set, the API server listens on the IPv6
+wildcard as well as IPv4, so firewall rules must cover both stacks (e.g.
+`ip6tables`/nftables rules in addition to IPv4 rules).
+
 - Ensure that ports used for internal communication (such as those for
 `torch.distributed` and KV cache transfer) are only accessible from trusted
 hosts or networks.
@@ -342,7 +346,7 @@ vLLM supports loading out-of-tree HTTP routes via the `vllm.endpoint_plugins` en
 
 ## gRPC Interface
 
-vLLM provides an optional gRPC Generate service on a separate TCP port, enabled via the `--grpc-port` flag. When not specified, no gRPC server is started. The gRPC listener binds to the same host address as the HTTP server.
+vLLM provides an optional gRPC Generate service on a separate TCP port, enabled via the `--grpc-port` flag. When not specified, no gRPC server is started. The gRPC listener binds to the same host address as the HTTP server; when `--host` is not set, both listeners accept connections on all supported address families (IPv4 and IPv6).
 
 **Warning:** The gRPC interface is **insecure by default** — it does not implement authentication, authorization, or encryption. It should be considered a private, internal interface intended for use only between co-located services within a trusted network. Do not expose the gRPC port to the public internet or untrusted clients. If you enable the gRPC interface, protect it via network-level access controls such as firewall rules, network segmentation, or deployment on an isolated private network.
 

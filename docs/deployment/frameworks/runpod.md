@@ -38,7 +38,7 @@ RunPod exposes HTTP services through its proxy. To make port 8000 accessible:
 A `502 Bad Gateway` error from the RunPod proxy typically means the server is not yet listening. Common causes:
 
 - **Model still loading** — Large models take time to download and load into GPU memory. Check the pod logs for progress.
-- **Wrong host binding** — Ensure you passed `--host 0.0.0.0`. Binding to `127.0.0.1` (the default) makes the server unreachable from the proxy.
+- **Wrong host binding** — By default the server listens on all interfaces and is reachable from the proxy. If your command sets `--host 127.0.0.1` (or another loopback address), the proxy cannot reach the server; remove the flag or use `--host 0.0.0.0`.
 - **Port mismatch** — Verify the `--port` value matches the port exposed in the RunPod dashboard.
 - **Out of GPU memory** — The model may be too large for the allocated GPU. Check logs for CUDA OOM errors and consider using a larger instance or adding `--tensor-parallel-size` for multi-GPU pods.
 
