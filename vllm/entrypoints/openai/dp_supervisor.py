@@ -24,6 +24,7 @@ from fastapi import FastAPI, Response
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.utils.network_utils import join_host_port
 from vllm.utils.system_utils import (
     decorate_logs,
     kill_process_tree,
@@ -323,10 +324,19 @@ class DPSupervisor:
         not return 503 to external probes while the engines are initializing.
         """
         app = _build_dp_supervisor_app(self)
-        host = self.args.host or "0.0.0.0"
+
+        # Bind with the same address-family contract as the API servers (an
+        # unset host listens on IPv4 and IPv6); uvicorn closes the passed
+        # sockets on shutdown. Import lazily: api_server is heavy.
+        from vllm.entrypoints.openai.api_server import create_server_sockets
+
+        sockets = create_server_sockets(
+            (self.args.host or None, self.supervisor_port), reuse_port=False
+        )
         config = uvicorn.Config(
             app,
-            host=host,
+            # Display only; the pre-bound sockets control the actual bind.
+            host=self.args.host or "0.0.0.0",
             port=self.supervisor_port,
             log_level=self.args.uvicorn_log_level,
             ssl_keyfile=self.args.ssl_keyfile,
@@ -337,7 +347,7 @@ class DPSupervisor:
         )
         supervisor_server = uvicorn.Server(config)
         supervisor_server_task = asyncio.create_task(
-            supervisor_server.serve(),
+            supervisor_server.serve(sockets=sockets),
             name="dp-supervisor",
         )
         supervisor_server_task.add_done_callback(
@@ -347,10 +357,15 @@ class DPSupervisor:
         # Ensure DPSupervisor task starts on the event loop.
         while not supervisor_server.started:
             if supervisor_server_task.done():
+                for sock in sockets:
+                    sock.close()
                 supervisor_server_task.result()
                 raise RuntimeError("DPSupervisor exited before startup.")
             await asyncio.sleep(0.05)
-        logger.info("Started DPSupervisor on %s:%d", host, self.supervisor_port)
+        logger.info(
+            "Started DPSupervisor on %s",
+            ", ".join(join_host_port(*s.getsockname()[:2]) for s in sockets),
+        )
         return supervisor_server, supervisor_server_task
 
     async def _wait_until_ready(self, monitor_task: asyncio.Task[None]) -> None:

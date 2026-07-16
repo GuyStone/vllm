@@ -295,7 +295,7 @@ async def test_shutdown_if_supervisor_server_error_on_startup(
             self.started = False
             self.should_exit = False
 
-        async def serve(self):
+        async def serve(self, sockets=None):
             raise ValueError("supervisor boom")
 
     async def fake_shutdown_children(self):
@@ -312,6 +312,11 @@ async def test_shutdown_if_supervisor_server_error_on_startup(
 
     monkeypatch.setattr(dp_sup.asyncio, "get_running_loop", lambda: FakeLoop())
     monkeypatch.setattr(dp_sup.uvicorn, "Server", FakeServer)
+    # Keep the unit test from binding a real port.
+    monkeypatch.setattr(
+        "vllm.entrypoints.openai.api_server.create_server_sockets",
+        lambda *_args, **_kwargs: [],
+    )
     monkeypatch.setattr(DPSupervisor, "_shutdown_children", fake_shutdown_children)
     monkeypatch.setattr(DPSupervisor, "_start_children", fake_start_children)
     monkeypatch.setattr(DPSupervisor, "_monitor_children", fake_monitor_children)
