@@ -47,6 +47,7 @@ from vllm.entrypoints.serve.utils.api_utils import log_version_and_model
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.network_utils import join_host_port
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -112,9 +113,10 @@ async def serve_grpc(args: argparse.Namespace):
     )
     reflection.enable_server_reflection(service_names, server)
 
-    # Bind to address
-    host = args.host or "0.0.0.0"
-    address = f"{host}:{args.port}"
+    # Bind to address. For an unset host, gRPC expands the IPv6 wildcard to
+    # every local address family and falls back to IPv4 on hosts without
+    # IPv6, matching the HTTP server's unset-host contract.
+    address = join_host_port(args.host, args.port) if args.host else f"[::]:{args.port}"
     server.add_insecure_port(address)
 
     try:
@@ -175,8 +177,9 @@ def main():
     parser.add_argument(
         "--host",
         type=str,
-        default="0.0.0.0",
-        help="Host to bind gRPC server to",
+        default=None,
+        help="Host to bind gRPC server to. When unset, listens on all "
+        "address families (IPv4 and IPv6).",
     )
     parser.add_argument(
         "--port",
