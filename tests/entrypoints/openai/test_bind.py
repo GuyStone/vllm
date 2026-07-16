@@ -224,8 +224,29 @@ def test_literal_host_binds_single_socket(host: str, family: socket.AddressFamil
         _close_all(sockets)
 
 
+@pytest.mark.skipif(not HAS_IPV6, reason="requires IPv6")
+@pytest.mark.skipif(
+    not hasattr(socket, "IPPROTO_IPV6"), reason="platform lacks IPPROTO_IPV6"
+)
+def test_literal_v6_wildcard_keeps_kernel_v6only_default():
+    """A literal '::' must not force IPV6_V6ONLY: the kernel default decides
+    whether the socket is dual-stack."""
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+        kernel_default = probe.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY)
+    sockets = create_server_sockets(("::", 0), reuse_port=False)
+    try:
+        assert len(sockets) == 1
+        assert (
+            sockets[0].getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY)
+            == kernel_default
+        )
+    finally:
+        _close_all(sockets)
+
+
 def test_unspecified_host_binds_available_families():
-    """host=None binds one socket per available family, all on one port."""
+    """host=None binds one socket per available family, all on one port,
+    with resolved AF_INET6 wildcards isolated from the IPv4 bind."""
     port, sockets = _create_sockets_on_open_port(None)
     try:
         families = {sock.family for sock in sockets}
@@ -234,6 +255,10 @@ def test_unspecified_host_binds_available_families():
         if HAS_IPV6:
             assert socket.AF_INET6 in families
         assert {sock.getsockname()[1] for sock in sockets} == {port}
+        if hasattr(socket, "IPPROTO_IPV6"):
+            for sock in sockets:
+                if sock.family == socket.AF_INET6:
+                    assert sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
     finally:
         _close_all(sockets)
 

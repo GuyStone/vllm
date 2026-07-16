@@ -65,12 +65,16 @@ def defer_addresses_stub_worker(listen_address, sockets, args, client_config):
 @pytest.fixture
 def api_server_args():
     """Fixture to provide arguments for APIServerProcessManager."""
+    # Two sockets, multi-family where the platform allows, to exercise
+    # pickling the socket list across the spawn boundary.
+    try:
+        second_sock = socket.socket(socket.AF_INET6)
+    except OSError:
+        second_sock = socket.socket()
     return {
         "target_server_fn": mock_run_api_server_worker,
         "listen_address": "localhost:8000",
-        # Two sockets to exercise pickling a multi-family socket list
-        # across the spawn boundary.
-        "sockets": [socket.socket(), socket.socket()],
+        "sockets": [socket.socket(), second_sock],
         "args": "test_args",  # Simple string to avoid pickling issues
         "num_servers": 3,
         "input_addresses": [
