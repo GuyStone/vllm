@@ -10,8 +10,7 @@ from http import HTTPStatus
 import pytest
 import requests
 
-from vllm.entrypoints.openai.api_server import create_server_sockets
-from vllm.utils.network_utils import get_open_port
+from vllm.utils.network_utils import create_server_sockets, get_open_port
 
 from ...utils import RemoteOpenAIServer
 

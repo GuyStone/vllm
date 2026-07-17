@@ -24,7 +24,7 @@ from fastapi import FastAPI, Response
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.utils.network_utils import join_host_port
+from vllm.utils.network_utils import create_server_sockets, join_host_port
 from vllm.utils.system_utils import (
     decorate_logs,
     kill_process_tree,
@@ -327,9 +327,7 @@ class DPSupervisor:
 
         # Bind with the same address-family contract as the API servers (an
         # unset host listens on IPv4 and IPv6); uvicorn closes the passed
-        # sockets on shutdown. Import lazily: api_server is heavy.
-        from vllm.entrypoints.openai.api_server import create_server_sockets
-
+        # sockets on shutdown.
         sockets = create_server_sockets(
             (self.args.host or None, self.supervisor_port), reuse_port=False
         )

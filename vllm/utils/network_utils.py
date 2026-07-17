@@ -147,6 +147,142 @@ def get_tcp_uri(ip: str, port: int) -> str:
         return f"tcp://{ip}:{port}"
 
 
+def create_server_sockets(
+    addr: tuple[str | None, int],
+    *,
+    reuse_port: bool,
+) -> list[socket.socket]:
+    """Create one bound server socket per address family for ``addr``.
+
+    Mirrors ``asyncio.base_events.BaseEventLoop.create_server``: an
+    unspecified host resolves via ``getaddrinfo(..., AI_PASSIVE)`` and binds
+    every returned family (IPv4 and IPv6), skipping families the platform
+    does not support. Literal addresses bind a single socket without a
+    resolver call.
+    """
+    host, port = addr
+    host = host or None
+
+    infos: list[tuple[socket.AddressFamily, socket.SocketKind, int, str, Any]]
+    if host is not None and (
+        is_valid_ipv4_address(host) or is_valid_ipv6_address(host)
+    ):
+        family = socket.AF_INET6 if is_valid_ipv6_address(host) else socket.AF_INET
+        infos = [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (host, port))]
+        # No IPV6_V6ONLY on a literal "::": keep the kernel's dual-stack
+        # default so it accepts IPv4 too.
+        set_v6only = False
+    else:
+        infos = list(
+            dict.fromkeys(
+                socket.getaddrinfo(
+                    host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+                )
+            )
+        )
+        set_v6only = True
+
+    # With port 0 and several families, the first bind picks the ephemeral
+    # port for the remaining families; an unrelated listener may already
+    # hold that port on another family, so retry with a fresh port.
+    attempts = 5 if port == 0 and len(infos) > 1 else 1
+    for attempt in range(attempts):
+        try:
+            return _bind_server_sockets(
+                infos, host, port, reuse_port=reuse_port, set_v6only=set_v6only
+            )
+        except OSError as exc:
+            if attempt == attempts - 1 or exc.errno != errno.EADDRINUSE:
+                raise
+    raise AssertionError("unreachable")
+
+
+def _bind_server_sockets(
+    infos: list[tuple[socket.AddressFamily, socket.SocketKind, int, str, Any]],
+    host: str | None,
+    port: int,
+    *,
+    reuse_port: bool,
+    set_v6only: bool,
+) -> list[socket.socket]:
+    sockets: list[socket.socket] = []
+    last_error: OSError | None = None
+    bound_port: int | None = None
+    completed = False
+    try:
+        for family, socktype, proto, _, sockaddr in infos:
+            try:
+                sock = socket.socket(family, socktype, proto)
+            except OSError as exc:
+                # The platform lacks support for this family (e.g. IPv6
+                # disabled); bind whatever families remain.
+                logger.warning(
+                    "Skipping %s for %s: socket creation failed (%s: %s)",
+                    family.name,
+                    sockaddr,
+                    errno.errorcode.get(exc.errno or 0, exc.errno),
+                    exc.strerror or exc,
+                )
+                last_error = exc
+                continue
+            sockets.append(sock)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if reuse_port:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            if (
+                set_v6only
+                and family == socket.AF_INET6
+                and hasattr(socket, "IPPROTO_IPV6")
+            ):
+                # Each resolved family gets its own wildcard socket; keep
+                # "::" from also claiming the IPv4-mapped wildcard and
+                # colliding with the "0.0.0.0" bind.
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            if port == 0 and bound_port is not None:
+                # Keep every family on the same ephemeral port.
+                sockaddr = (sockaddr[0], bound_port, *sockaddr[2:])
+            try:
+                sock.bind(sockaddr)
+            except OSError as exc:
+                if exc.errno == errno.EADDRNOTAVAIL:
+                    # The resolver returned an address this machine cannot
+                    # bind (family present but not configured); skip it.
+                    logger.warning(
+                        "Skipping %s (%s): bind failed (EADDRNOTAVAIL: %s)",
+                        sockaddr,
+                        family.name,
+                        exc.strerror or exc,
+                    )
+                    last_error = exc
+                    sockets.remove(sock)
+                    sock.close()
+                    continue
+                raise OSError(
+                    exc.errno,
+                    f"error while attempting to bind on address {sockaddr!r}: {exc}",
+                ) from None
+            if port == 0 and bound_port is None:
+                bound_port = sock.getsockname()[1]
+            logger.debug(
+                "Bound server socket family=%s type=%s proto=%s sockaddr=%s",
+                family,
+                socktype,
+                proto,
+                sockaddr,
+            )
+        if not sockets:
+            raise OSError(
+                f"could not bind to any address for host {host!r} port {port}"
+            ) from last_error
+        completed = True
+    finally:
+        if not completed:
+            for sock in sockets:
+                sock.close()
+
+    return sockets
+
+
 def get_open_zmq_ipc_path() -> str:
     base_rpc_path = envs.VLLM_RPC_BASE_PATH
     return f"ipc://{base_rpc_path}/{uuid4()}"

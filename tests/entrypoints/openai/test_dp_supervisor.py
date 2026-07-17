@@ -314,7 +314,7 @@ async def test_shutdown_if_supervisor_server_error_on_startup(
     monkeypatch.setattr(dp_sup.uvicorn, "Server", FakeServer)
     # Keep the unit test from binding a real port.
     monkeypatch.setattr(
-        "vllm.entrypoints.openai.api_server.create_server_sockets",
+        "vllm.entrypoints.openai.dp_supervisor.create_server_sockets",
         lambda *_args, **_kwargs: [],
     )
     monkeypatch.setattr(DPSupervisor, "_shutdown_children", fake_shutdown_children)
